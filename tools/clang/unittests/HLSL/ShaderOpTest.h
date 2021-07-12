@@ -25,6 +25,9 @@
 #include <unordered_set>
 #include <vector>
 
+// We need to keep & fix these warnings to integrate smoothly with HLK
+#pragma warning(error: 4100 4146 4242 4244 4267 4701 4389)
+
 ///////////////////////////////////////////////////////////////////////////////
 // Forward declarations.
 namespace dxc {
@@ -237,11 +240,7 @@ public:
 // Use this structure to refer to a command allocator/list/queue triple.
 struct CommandListRefs {
   CComPtr<ID3D12CommandAllocator> Allocator;
-#if defined(NTDDI_WIN10_VB) && WDK_NTDDI_VERSION >= NTDDI_WIN10_VB
-  CComPtr<ID3D12GraphicsCommandList6> List;
-#else
   CComPtr<ID3D12GraphicsCommandList> List;
-#endif
   CComPtr<ID3D12CommandQueue> Queue;
 
   void CreateForDevice(ID3D12Device *pDevice, bool compute);

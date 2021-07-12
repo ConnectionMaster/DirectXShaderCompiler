@@ -9,6 +9,9 @@
 //                                                                           //
 ///////////////////////////////////////////////////////////////////////////////
 
+// We need to keep & fix these warnings to integrate smoothly with HLK
+#pragma warning(error: 4100 4146 4242 4244 4267 4701 4389)
+
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
@@ -297,7 +300,7 @@ void ShaderOpTest::CreateDescriptorHeaps() {
 
     const UINT descriptorSize = m_pDevice->GetDescriptorHandleIncrementSize(H.Desc.Type);
     CD3DX12_CPU_DESCRIPTOR_HANDLE cpuHandle(pHeap->GetCPUDescriptorHandleForHeapStart());
-    CD3DX12_GPU_DESCRIPTOR_HANDLE gpuHandle;
+    CD3DX12_GPU_DESCRIPTOR_HANDLE gpuHandle = {};
     if (H.Desc.Type != D3D12_DESCRIPTOR_HEAP_TYPE_RTV)
         gpuHandle = CD3DX12_GPU_DESCRIPTOR_HANDLE(pHeap->GetGPUDescriptorHandleForHeapStart());
     for (ShaderOpDescriptor &D : H.Descriptors) {
@@ -472,10 +475,10 @@ void ShaderOpTest::CreatePipelineState() {
     PDesc.SizeInBytes = sizeof(MDesc);
     PDesc.pPipelineStateSubobjectStream = &MDesc;
 
-    ID3D12Device2 *pDevice2;
+    CComPtr<ID3D12Device2> pDevice2;
     CHECK_HR(m_pDevice->QueryInterface(&pDevice2));
 
-    pDevice2->CreatePipelineState(&PDesc, IID_PPV_ARGS(&m_pPSO));
+    CHECK_HR(pDevice2->CreatePipelineState(&PDesc, IID_PPV_ARGS(&m_pPSO)));
   }
 #endif
   else {
@@ -899,7 +902,12 @@ void ShaderOpTest::RunCommandList() {
 
 #if defined(NTDDI_WIN10_VB) && WDK_NTDDI_VERSION >= NTDDI_WIN10_VB
     if (m_pShaderOp->MS) {
-      ID3D12GraphicsCommandList6 *pList6 = m_CommandList.List.p;
+#ifndef NDEBUG
+      D3D12_FEATURE_DATA_D3D12_OPTIONS7 O7;
+      DXASSERT_LOCALVAR(O7, SUCCEEDED(m_pDevice->CheckFeatureSupport((D3D12_FEATURE)D3D12_FEATURE_D3D12_OPTIONS7, &O7, sizeof(O7))), "mesh shader test enabled on platform without mesh support");
+#endif
+      CComPtr<ID3D12GraphicsCommandList6> pList6;
+      CHECK_HR(m_CommandList.List.p->QueryInterface(&pList6));
       pList6->BeginQuery(m_pQueryHeap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
       pList6->DispatchMesh(1, 1, 1);
       pList6->EndQuery(m_pQueryHeap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
@@ -1898,6 +1906,7 @@ void ShaderOpParser::ParseRenderTargets(IXmlReader *pReader, std::vector<ShaderO
       CHECK_HR(pReader->GetLocalName(&pLocalName, nullptr));
       if (0 == wcscmp(pLocalName, L"RenderTarget")) {
         ShaderOpRenderTarget RT;
+        ZeroMemory(&RT, sizeof(RT));
         ParseRenderTarget(pReader, &RT);
         pRenderTargets->push_back(RT);
       }

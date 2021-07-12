@@ -1861,7 +1861,7 @@ The following signature shows the operation syntax::
 
   ; overloads: SM5.1: i32,  SM6.0: i32
   ; returns: original value in memory before the operation
-  declare i32 @dx.op.atomicBinOp.i32(
+  declare i32 @dx.op.atomicCompareExchange.i32(
       i32,                  ; opcode
       %dx.types.Handle,     ; resource handle
       i32,                  ; coordinate c0
@@ -2967,7 +2967,7 @@ The set of validation rules that are known to hold for a DXIL program is identif
 ========================================= ========================================================================================================================================================================================================================================================================================================
 Rule Code                                 Description
 ========================================= ========================================================================================================================================================================================================================================================================================================
-BITCODE.VALID                             TODO - Module must be bitcode-valid
+BITCODE.VALID                             Module must be bitcode-valid
 CONTAINER.PARTINVALID                     DXIL Container must not contain unknown parts
 CONTAINER.PARTMATCHES                     DXIL Container Parts must match Module
 CONTAINER.PARTMISSING                     DXIL Container requires certain parts, corresponding to module
@@ -3094,7 +3094,7 @@ META.KNOWN                                Named metadata should be known
 META.MAXTESSFACTOR                        Hull Shader MaxTessFactor must be [%0..%1].  %2 specified.
 META.NOENTRYPROPSFORENTRY                 Entry point %0 must have entry properties.
 META.NOSEMANTICOVERLAP                    Semantics must not overlap
-META.REQUIRED                             TODO - Required metadata missing.
+META.REQUIRED                             Required metadata missing.
 META.SEMAKINDMATCHESNAME                  Semantic name must match system value, when defined.
 META.SEMAKINDVALID                        Semantic kind must be valid
 META.SEMANTICCOMPTYPE                     %0 must be %1.
@@ -3118,7 +3118,8 @@ META.TEXTURETYPE                          elements of typed buffers and textures
 META.USED                                 All metadata must be used by dxil.
 META.VALIDSAMPLERMODE                     Invalid sampler mode on sampler .
 META.VALUERANGE                           Metadata value must be within range.
-META.WELLFORMED                           TODO - Metadata must be well-formed in operand count and types.
+META.VERSIONSUPPORTED                     Version in metadata must be supported.
+META.WELLFORMED                           Metadata must be well-formed in operand count and types.
 SM.64BITRAWBUFFERLOADSTORE                i64/f64 rawBufferLoad/Store overloads are allowed after SM 6.3.
 SM.AMPLIFICATIONSHADERPAYLOADSIZE         For amplification shader with entry '%0', payload size %1 is greater than maximum size of %2 bytes.
 SM.AMPLIFICATIONSHADERPAYLOADSIZEDECLARED For amplification shader with entry '%0', payload size %1 is greater than declared size of %2 bytes.
@@ -3126,6 +3127,7 @@ SM.APPENDANDCONSUMEONSAMEUAV              BufferUpdateCounter inc and dec on a g
 SM.CBUFFERARRAYOFFSETALIGNMENT            CBuffer array offset must be aligned to 16-bytes
 SM.CBUFFERELEMENTOVERFLOW                 CBuffer elements must not overflow
 SM.CBUFFEROFFSETOVERLAP                   CBuffer offsets must not overlap
+SM.CBUFFERSIZE                            CBuffer size must not exceed 65536 bytes
 SM.CBUFFERTEMPLATETYPEMUSTBESTRUCT        D3D12 constant/texture buffer template element can only be a struct.
 SM.COMPLETEPOSITION                       Not all elements of SV_Position were written.
 SM.CONSTANTINTERPMODE                     Interpolation mode must be constant for MS primitive output.
@@ -3184,6 +3186,7 @@ SM.SEMANTIC                               Semantic must be defined in target sha
 SM.STREAMINDEXRANGE                       Stream index (%0) must between 0 and %1.
 SM.TESSFACTORFORDOMAIN                    Required TessFactor for domain not found declared anywhere in Patch Constant data.
 SM.TESSFACTORSIZEMATCHDOMAIN              TessFactor rows, columns (%0, %1) invalid for domain %2.  Expected %3 rows and 1 column.
+SM.TGSMUNSUPPORTED                        Thread Group Shared Memory not supported %0.
 SM.THREADGROUPCHANNELRANGE                Declared Thread Group %0 size %1 outside valid range [%2..%3].
 SM.TRIOUTPUTPRIMITIVEMISMATCH             Hull Shader declared with Tri Domain must specify output primitive point, triangle_cw or triangle_ccw. Line output is not compatible with the Tri domain.
 SM.UNDEFINEDOUTPUT                        Not all elements of output %0 were written.

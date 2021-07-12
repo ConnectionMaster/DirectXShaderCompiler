@@ -14,6 +14,7 @@
 #include "dxc/DXIL/DxilUtil.h"
 #include "dxc/DXIL/DxilModule.h"
 #include "dxc/DXIL/DxilOperations.h"
+#include "dxc/HLSL/DxilConvergentName.h"
 #include "dxc/Support/Global.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/Twine.h"
@@ -120,7 +121,8 @@ bool RemoveUnusedFunctions(Module &M, Function *EntryFunc,
   for (auto &F : M.functions()) {
     if (&F == EntryFunc || &F == PatchConstantFunc)
       continue;
-    if (F.isDeclaration() || !IsLib) {
+    if (F.isDeclaration() || !IsLib ||
+        F.hasInternalLinkage()) {
       if (F.user_empty())
         deadList.emplace_back(&F);
     }
@@ -287,56 +289,57 @@ void EmitWarningOnInstruction(Instruction *I, Twine Msg) {
   EmitWarningOrErrorOnInstruction(I, Msg, DiagnosticSeverity::DS_Warning);
 }
 
-static void EmitWarningOrErrorOnFunction(Function *F, Twine Msg,
+static void EmitWarningOrErrorOnFunction(llvm::LLVMContext &Ctx, Function *F, Twine Msg,
                                          DiagnosticSeverity severity) {
-  DISubprogram *DISP = getDISubprogram(F);
   DILocation *DLoc = nullptr;
-  if (DISP) {
+
+  if (DISubprogram *DISP = getDISubprogram(F)) {
     DLoc = DILocation::get(F->getContext(), DISP->getLine(), 0,
                            DISP, nullptr /*InlinedAt*/);
   }
-  F->getContext().diagnose(DiagnosticInfoDxil(F, DLoc, Msg, severity));
+  Ctx.diagnose(DiagnosticInfoDxil(F, DLoc, Msg, severity));
 }
 
-void EmitErrorOnFunction(Function *F, Twine Msg) {
-  EmitWarningOrErrorOnFunction(F, Msg, DiagnosticSeverity::DS_Error);
+void EmitErrorOnFunction(llvm::LLVMContext &Ctx, Function *F, Twine Msg) {
+  EmitWarningOrErrorOnFunction(Ctx, F, Msg, DiagnosticSeverity::DS_Error);
 }
 
-void EmitWarningOnFunction(Function *F, Twine Msg) {
-  EmitWarningOrErrorOnFunction(F, Msg, DiagnosticSeverity::DS_Warning);
+void EmitWarningOnFunction(llvm::LLVMContext &Ctx, Function *F, Twine Msg) {
+  EmitWarningOrErrorOnFunction(Ctx, F, Msg, DiagnosticSeverity::DS_Warning);
 }
 
-static void EmitWarningOrErrorOnGlobalVariable(GlobalVariable *GV,
+static void EmitWarningOrErrorOnGlobalVariable(llvm::LLVMContext &Ctx, GlobalVariable *GV,
                                                Twine Msg, DiagnosticSeverity severity) {
   DIVariable *DIV = nullptr;
-  if (!GV) return;
 
-  Module &M = *GV->getParent();
   DILocation *DLoc = nullptr;
 
-  if (getDebugMetadataVersionFromModule(M) != 0) {
-    DebugInfoFinder FinderObj;
-    DebugInfoFinder &Finder = FinderObj;
-    // Debug modules have no dxil modules. Use it if you got it.
-    if (M.HasDxilModule())
-      Finder = M.GetDxilModule().GetOrCreateDebugInfoFinder();
-    else
-      Finder.processModule(M);
-    DIV = FindGlobalVariableDebugInfo(GV, Finder);
-    if (DIV)
-      DLoc = DILocation::get(GV->getContext(), DIV->getLine(), 0,
-                             DIV->getScope(), nullptr /*InlinedAt*/);
+  if (GV) {
+    Module &M = *GV->getParent();
+    if (hasDebugInfo(M)) {
+      DebugInfoFinder FinderObj;
+      DebugInfoFinder &Finder = FinderObj;
+      // Debug modules have no dxil modules. Use it if you got it.
+      if (M.HasDxilModule())
+        Finder = M.GetDxilModule().GetOrCreateDebugInfoFinder();
+      else
+        Finder.processModule(M);
+      DIV = FindGlobalVariableDebugInfo(GV, Finder);
+      if (DIV)
+        DLoc = DILocation::get(GV->getContext(), DIV->getLine(), 0,
+                               DIV->getScope(), nullptr /*InlinedAt*/);
+    }
   }
 
-  GV->getContext().diagnose(DiagnosticInfoDxil(nullptr /*Function*/, DLoc, Msg, severity));
+  Ctx.diagnose(DiagnosticInfoDxil(nullptr /*Function*/, DLoc, Msg, severity));
 }
 
-void EmitErrorOnGlobalVariable(GlobalVariable *GV, Twine Msg) {
-  EmitWarningOrErrorOnGlobalVariable(GV, Msg, DiagnosticSeverity::DS_Error);
+void EmitErrorOnGlobalVariable(llvm::LLVMContext &Ctx, GlobalVariable *GV, Twine Msg) {
+  EmitWarningOrErrorOnGlobalVariable(Ctx, GV, Msg, DiagnosticSeverity::DS_Error);
 }
 
-void EmitWarningOnGlobalVariable(GlobalVariable *GV, Twine Msg) {
-  EmitWarningOrErrorOnGlobalVariable(GV, Msg, DiagnosticSeverity::DS_Warning);
+void EmitWarningOnGlobalVariable(llvm::LLVMContext &Ctx, GlobalVariable *GV, Twine Msg) {
+  EmitWarningOrErrorOnGlobalVariable(Ctx, GV, Msg, DiagnosticSeverity::DS_Warning);
 }
 
 const char *kResourceMapErrorMsg =
@@ -667,6 +670,12 @@ std::pair<bool, DxilResourceProperties> GetHLSLResourceProperties(llvm::Type *Ty
     if (name == "RaytracingAccelerationStructure")
       return RetType(true, MakeResourceProperties(hlsl::DXIL::ResourceKind::RTAccelerationStructure, false, false, false));
 
+    if (name.startswith("ConstantBuffer<"))
+      return RetType(true, MakeResourceProperties(hlsl::DXIL::ResourceKind::CBuffer, false, false, false));
+
+    if (name.startswith("TextureBuffer<"))
+      return RetType(true, MakeResourceProperties(hlsl::DXIL::ResourceKind::TBuffer, false, false, false));
+
     if (ConsumePrefix(name, "FeedbackTexture2D")) {
       hlsl::DXIL::ResourceKind kind = hlsl::DXIL::ResourceKind::Invalid;
       if (ConsumePrefix(name, "Array"))
@@ -676,6 +685,8 @@ std::pair<bool, DxilResourceProperties> GetHLSLResourceProperties(llvm::Type *Ty
 
       if (name.startswith("<"))
         return RetType(true, MakeResourceProperties(kind, false, false, false));
+
+      return FalseRet;
     }
 
     bool ROV = ConsumePrefix(name, "RasterizerOrdered");
@@ -732,6 +743,9 @@ bool IsHLSLObjectType(llvm::Type *Ty) {
     StringRef name = ST->getName();
     // TODO: don't check names.
     if (name.startswith("dx.types.wave_t"))
+      return true;
+
+    if (name.compare("dx.types.Handle") == 0)
       return true;
 
     if (name.endswith("_slice_type"))
@@ -1157,6 +1171,67 @@ void ReplaceRawBufferStore64Bit(llvm::Function *F, llvm::Type *ETy, hlsl::OP *hl
       DXASSERT(false, "function can only be used with call instructions.");
     }
   }
+}
+
+bool IsConvergentMarker(const char *Name) {
+  StringRef RName = Name;
+  return RName.startswith(kConvergentFunctionPrefix);
+}
+
+bool IsConvergentMarker(const Function *F) {
+  return F && F->getName().startswith(kConvergentFunctionPrefix);
+}
+
+bool IsConvergentMarker(Value *V) {
+  CallInst *CI = dyn_cast<CallInst>(V);
+  if (!CI)
+    return false;
+  return IsConvergentMarker(CI->getCalledFunction());
+}
+
+Value *GetConvergentSource(Value *V) {
+  return cast<CallInst>(V)->getOperand(0);
+}
+
+/// If value is a bitcast to base class pattern, equivalent
+/// to a getelementptr X, 0, 0, 0...  turn it into the appropriate gep.
+/// This can enhance SROA and other transforms that want type-safe pointers,
+/// and enables merging with other getelementptr's.
+Value *TryReplaceBaseCastWithGep(Value *V) {
+  if (BitCastOperator *BCO = dyn_cast<BitCastOperator>(V)) {
+    if (!BCO->getSrcTy()->isPointerTy())
+      return nullptr;
+
+    Type *SrcElTy = BCO->getSrcTy()->getPointerElementType();
+    Type *DstElTy = BCO->getDestTy()->getPointerElementType();
+
+    // Adapted from code in InstCombiner::visitBitCast
+    unsigned NumZeros = 0;
+    while (SrcElTy != DstElTy && isa<CompositeType>(SrcElTy) &&
+           !SrcElTy->isPointerTy() &&
+           SrcElTy->getNumContainedTypes() /* not "{}" */) {
+      SrcElTy = cast<CompositeType>(SrcElTy)->getTypeAtIndex(0U);
+      ++NumZeros;
+    }
+
+    // If we found a path from the src to dest, create the getelementptr now.
+    if (SrcElTy == DstElTy) {
+      IRBuilder<> Builder(BCO->getContext());
+      StringRef Name = "";
+      if (Instruction *I = dyn_cast<Instruction>(BCO)) {
+        Builder.SetInsertPoint(I);
+        Name = I->getName();
+      }
+      SmallVector<Value *, 8> Indices(NumZeros + 1, Builder.getInt32(0));
+      Value *newGEP = Builder.CreateInBoundsGEP(nullptr, BCO->getOperand(0), Indices, Name);
+      V->replaceAllUsesWith(newGEP);
+      if (auto *I = dyn_cast<Instruction>(V))
+        I->eraseFromParent();
+      return newGEP;
+    }
+  }
+
+  return nullptr;
 }
 
 }

@@ -398,6 +398,125 @@ SpirvLayoutRule getLayoutRuleForExternVar(QualType type,
   return SpirvLayoutRule::Void;
 }
 
+spv::ImageFormat getSpvImageFormat(const VKImageFormatAttr *imageFormatAttr) {
+  if (imageFormatAttr == nullptr)
+    return spv::ImageFormat::Unknown;
+
+  switch (imageFormatAttr->getImageFormat()) {
+  case VKImageFormatAttr::unknown:
+    return spv::ImageFormat::Unknown;
+  case VKImageFormatAttr::rgba32f:
+    return spv::ImageFormat::Rgba32f;
+  case VKImageFormatAttr::rgba16f:
+    return spv::ImageFormat::Rgba16f;
+  case VKImageFormatAttr::r32f:
+    return spv::ImageFormat::R32f;
+  case VKImageFormatAttr::rgba8:
+    return spv::ImageFormat::Rgba8;
+  case VKImageFormatAttr::rgba8snorm:
+    return spv::ImageFormat::Rgba8Snorm;
+  case VKImageFormatAttr::rg32f:
+    return spv::ImageFormat::Rg32f;
+  case VKImageFormatAttr::rg16f:
+    return spv::ImageFormat::Rg16f;
+  case VKImageFormatAttr::r11g11b10f:
+    return spv::ImageFormat::R11fG11fB10f;
+  case VKImageFormatAttr::r16f:
+    return spv::ImageFormat::R16f;
+  case VKImageFormatAttr::rgba16:
+    return spv::ImageFormat::Rgba16;
+  case VKImageFormatAttr::rgb10a2:
+    return spv::ImageFormat::Rgb10A2;
+  case VKImageFormatAttr::rg16:
+    return spv::ImageFormat::Rg16;
+  case VKImageFormatAttr::rg8:
+    return spv::ImageFormat::Rg8;
+  case VKImageFormatAttr::r16:
+    return spv::ImageFormat::R16;
+  case VKImageFormatAttr::r8:
+    return spv::ImageFormat::R8;
+  case VKImageFormatAttr::rgba16snorm:
+    return spv::ImageFormat::Rgba16Snorm;
+  case VKImageFormatAttr::rg16snorm:
+    return spv::ImageFormat::Rg16Snorm;
+  case VKImageFormatAttr::rg8snorm:
+    return spv::ImageFormat::Rg8Snorm;
+  case VKImageFormatAttr::r16snorm:
+    return spv::ImageFormat::R16Snorm;
+  case VKImageFormatAttr::r8snorm:
+    return spv::ImageFormat::R8Snorm;
+  case VKImageFormatAttr::rgba32i:
+    return spv::ImageFormat::Rgba32i;
+  case VKImageFormatAttr::rgba16i:
+    return spv::ImageFormat::Rgba16i;
+  case VKImageFormatAttr::rgba8i:
+    return spv::ImageFormat::Rgba8i;
+  case VKImageFormatAttr::r32i:
+    return spv::ImageFormat::R32i;
+  case VKImageFormatAttr::rg32i:
+    return spv::ImageFormat::Rg32i;
+  case VKImageFormatAttr::rg16i:
+    return spv::ImageFormat::Rg16i;
+  case VKImageFormatAttr::rg8i:
+    return spv::ImageFormat::Rg8i;
+  case VKImageFormatAttr::r16i:
+    return spv::ImageFormat::R16i;
+  case VKImageFormatAttr::r8i:
+    return spv::ImageFormat::R8i;
+  case VKImageFormatAttr::rgba32ui:
+    return spv::ImageFormat::Rgba32ui;
+  case VKImageFormatAttr::rgba16ui:
+    return spv::ImageFormat::Rgba16ui;
+  case VKImageFormatAttr::rgba8ui:
+    return spv::ImageFormat::Rgba8ui;
+  case VKImageFormatAttr::r32ui:
+    return spv::ImageFormat::R32ui;
+  case VKImageFormatAttr::rgb10a2ui:
+    return spv::ImageFormat::Rgb10a2ui;
+  case VKImageFormatAttr::rg32ui:
+    return spv::ImageFormat::Rg32ui;
+  case VKImageFormatAttr::rg16ui:
+    return spv::ImageFormat::Rg16ui;
+  case VKImageFormatAttr::rg8ui:
+    return spv::ImageFormat::Rg8ui;
+  case VKImageFormatAttr::r16ui:
+    return spv::ImageFormat::R16ui;
+  case VKImageFormatAttr::r8ui:
+    return spv::ImageFormat::R8ui;
+  case VKImageFormatAttr::r64ui:
+    return spv::ImageFormat::R64ui;
+  case VKImageFormatAttr::r64i:
+    return spv::ImageFormat::R64i;
+  }
+  return spv::ImageFormat::Unknown;
+}
+
+// Inserts seen semantics for entryPoint to seenSemanticsForEntryPoints. Returns
+// whether it does not already exist in seenSemanticsForEntryPoints.
+bool insertSeenSemanticsForEntryPointIfNotExist(
+    llvm::SmallDenseMap<SpirvFunction *, llvm::StringSet<>>
+        *seenSemanticsForEntryPoints,
+    SpirvFunction *entryPoint, const std::string &semantics) {
+  auto seenSemanticsForEntryPointsItr =
+      seenSemanticsForEntryPoints->find(entryPoint);
+  if (seenSemanticsForEntryPointsItr == seenSemanticsForEntryPoints->end()) {
+    bool insertResult = false;
+    std::tie(seenSemanticsForEntryPointsItr, insertResult) =
+        seenSemanticsForEntryPoints->insert(
+            std::make_pair(entryPoint, llvm::StringSet<>()));
+    assert(insertResult);
+    seenSemanticsForEntryPointsItr->second.insert(semantics);
+    return true;
+  }
+
+  auto &seenSemantics = seenSemanticsForEntryPointsItr->second;
+  if (seenSemantics.count(semantics)) {
+    return false;
+  }
+  seenSemantics.insert(semantics);
+  return true;
+}
+
 } // anonymous namespace
 
 std::string StageVar::getSemanticStr() const {
@@ -847,8 +966,14 @@ SpirvVariable *DeclResultIdMapper::createExternVar(const VarDecl *var) {
       type, storageClass, var->hasAttr<HLSLPreciseAttr>(), name, llvm::None,
       loc);
   varInstr->setLayoutRule(rule);
-  DeclSpirvInfo info(varInstr);
-  astDecls[var] = info;
+
+  // If this variable has [[vk::image_format("..")]] attribute, we have to keep
+  // it in the SpirvContext and use it when we lower the QualType to SpirvType.
+  auto spvImageFormat = getSpvImageFormat(var->getAttr<VKImageFormatAttr>());
+  if (spvImageFormat != spv::ImageFormat::Unknown)
+    spvContext.registerImageFormatForSpirvVariable(varInstr, spvImageFormat);
+
+  astDecls[var] = createDeclSpirvInfo(varInstr);
 
   createDebugGlobalVariable(varInstr, type, loc, name);
 
@@ -891,8 +1016,7 @@ DeclResultIdMapper::createOrUpdateStringVar(const VarDecl *var) {
   const StringLiteral *stringLiteral =
       dyn_cast<StringLiteral>(var->getInit()->IgnoreParenCasts());
   SpirvString *init = spvBuilder.getString(stringLiteral->getString());
-  DeclSpirvInfo info(init);
-  astDecls[var] = info;
+  astDecls[var] = createDeclSpirvInfo(init);
   return init;
 }
 
@@ -912,6 +1036,8 @@ SpirvVariable *DeclResultIdMapper::createStructOrStructArrayVarOfExplicitLayout(
   const bool forPC = usageKind == ContextUsageKind::PushConstant;
   const bool forShaderRecordNV =
       usageKind == ContextUsageKind::ShaderRecordBufferNV;
+  const bool forShaderRecordEXT =
+      usageKind == ContextUsageKind::ShaderRecordBufferEXT;
 
   const auto &declGroup = collectDeclsInDeclContext(decl);
 
@@ -960,7 +1086,9 @@ SpirvVariable *DeclResultIdMapper::createStructOrStructArrayVarOfExplicitLayout(
   const auto sc = forPC ? spv::StorageClass::PushConstant
                         : forShaderRecordNV
                               ? spv::StorageClass::ShaderRecordBufferNV
-                              : spv::StorageClass::Uniform;
+                              : forShaderRecordEXT
+                                    ? spv::StorageClass::ShaderRecordBufferKHR
+                                    : spv::StorageClass::Uniform;
 
   // Create the variable for the whole struct / struct array.
   // The fields may be 'precise', but the structure itself is not.
@@ -985,7 +1113,7 @@ void DeclResultIdMapper::createEnumConstant(const EnumConstantDecl *decl) {
   SpirvVariable *varInstr = spvBuilder.addModuleVar(
       astContext.IntTy, spv::StorageClass::Private, /*isPrecise*/ false,
       decl->getName(), enumConstant, decl->getLocation());
-  astDecls[valueDecl] = DeclSpirvInfo(varInstr);
+  astDecls[valueDecl] = createDeclSpirvInfo(varInstr);
 }
 
 SpirvVariable *DeclResultIdMapper::createCTBuffer(const HLSLBufferDecl *decl) {
@@ -1007,7 +1135,7 @@ SpirvVariable *DeclResultIdMapper::createCTBuffer(const HLSLBufferDecl *decl) {
       continue;
 
     const auto *varDecl = cast<VarDecl>(subDecl);
-    astDecls[varDecl] = DeclSpirvInfo(bufferVar, index++);
+    astDecls[varDecl] = createDeclSpirvInfo(bufferVar, index++);
   }
   resourceVars.emplace_back(
       bufferVar, decl, decl->getLocation(), getResourceBinding(decl),
@@ -1081,7 +1209,7 @@ SpirvVariable *DeclResultIdMapper::createCTBuffer(const VarDecl *decl) {
       decl->getName());
 
   // We register the VarDecl here.
-  astDecls[decl] = DeclSpirvInfo(bufferVar);
+  astDecls[decl] = createDeclSpirvInfo(bufferVar);
   resourceVars.emplace_back(
       bufferVar, decl, decl->getLocation(), getResourceBinding(decl),
       decl->getAttr<VKBindingAttr>(), decl->getAttr<VKCounterBindingAttr>());
@@ -1108,7 +1236,7 @@ SpirvVariable *DeclResultIdMapper::createPushConstant(const VarDecl *decl) {
       structName, decl->getName());
 
   // Register the VarDecl
-  astDecls[decl] = DeclSpirvInfo(var);
+  astDecls[decl] = createDeclSpirvInfo(var);
 
   // Do not push this variable into resourceVars since it does not need
   // descriptor set.
@@ -1117,19 +1245,27 @@ SpirvVariable *DeclResultIdMapper::createPushConstant(const VarDecl *decl) {
 }
 
 SpirvVariable *
-DeclResultIdMapper::createShaderRecordBufferNV(const VarDecl *decl) {
+DeclResultIdMapper::createShaderRecordBuffer(const VarDecl *decl, 
+                                                ContextUsageKind kind) {
   const auto *recordType =
       hlsl::GetHLSLResourceResultType(decl->getType())->getAs<RecordType>();
   assert(recordType);
 
+  assert(kind == ContextUsageKind::ShaderRecordBufferEXT ||
+         kind == ContextUsageKind::ShaderRecordBufferNV);
+
+  const auto typeName = kind == ContextUsageKind::ShaderRecordBufferEXT
+                            ? "type.ShaderRecordBufferEXT."
+                            : "type.ShaderRecordBufferNV.";
+
   const std::string structName =
-      "type.ShaderRecordBufferNV." + recordType->getDecl()->getName().str();
+      typeName + recordType->getDecl()->getName().str();
   SpirvVariable *var = createStructOrStructArrayVarOfExplicitLayout(
       recordType->getDecl(), /*arraySize*/ 0,
-      ContextUsageKind::ShaderRecordBufferNV, structName, decl->getName());
+      kind, structName, decl->getName());
 
   // Register the VarDecl
-  astDecls[decl] = DeclSpirvInfo(var);
+  astDecls[decl] = createDeclSpirvInfo(var);
 
   // Do not push this variable into resourceVars since it does not need
   // descriptor set.
@@ -1138,13 +1274,20 @@ DeclResultIdMapper::createShaderRecordBufferNV(const VarDecl *decl) {
 }
 
 SpirvVariable *
-DeclResultIdMapper::createShaderRecordBufferNV(const HLSLBufferDecl *decl) {
+DeclResultIdMapper::createShaderRecordBuffer(const HLSLBufferDecl *decl,
+                                               ContextUsageKind kind) {
+  assert(kind == ContextUsageKind::ShaderRecordBufferEXT ||
+         kind == ContextUsageKind::ShaderRecordBufferNV);
+
+  const auto typeName = kind == ContextUsageKind::ShaderRecordBufferEXT
+                            ? "type.ShaderRecordBufferEXT."
+                            : "type.ShaderRecordBufferNV.";
 
   const std::string structName =
-      "type.ShaderRecordBufferNV." + decl->getName().str();
+      typeName + decl->getName().str();
   // The front-end does not allow arrays of cbuffer/tbuffer.
   SpirvVariable *bufferVar = createStructOrStructArrayVarOfExplicitLayout(
-      decl, /*arraySize*/ 0, ContextUsageKind::ShaderRecordBufferNV, structName,
+      decl, /*arraySize*/ 0, kind, structName,
       decl->getName());
 
   // We still register all VarDecls seperately here. All the VarDecls are
@@ -1157,7 +1300,7 @@ DeclResultIdMapper::createShaderRecordBufferNV(const HLSLBufferDecl *decl) {
       continue;
 
     const auto *varDecl = cast<VarDecl>(subDecl);
-    astDecls[varDecl] = DeclSpirvInfo(bufferVar, index++);
+    astDecls[varDecl] = createDeclSpirvInfo(bufferVar, index++);
   }
   return bufferVar;
 }
@@ -1193,7 +1336,7 @@ void DeclResultIdMapper::createGlobalsCBuffer(const VarDecl *var) {
         return;
       }
 
-      astDecls[varDecl] = DeclSpirvInfo(globals, index++);
+      astDecls[varDecl] = createDeclSpirvInfo(globals, index++);
     }
   }
 }
@@ -1266,7 +1409,7 @@ DeclResultIdMapper::getCounterVarFields(const DeclaratorDecl *decl) {
 void DeclResultIdMapper::registerSpecConstant(const VarDecl *decl,
                                               SpirvInstruction *specConstant) {
   specConstant->setRValue();
-  astDecls[decl] = DeclSpirvInfo(specConstant);
+  astDecls[decl] = createDeclSpirvInfo(specConstant);
 }
 
 void DeclResultIdMapper::createCounterVar(
@@ -1343,7 +1486,8 @@ DeclResultIdMapper::getCTBufferPushConstantType(const DeclContext *decl) {
   return found->second;
 }
 
-std::vector<SpirvVariable *> DeclResultIdMapper::collectStageVars() const {
+std::vector<SpirvVariable *>
+DeclResultIdMapper::collectStageVars(SpirvFunction *entryPoint) const {
   std::vector<SpirvVariable *> vars;
 
   for (auto var : glPerVertex.getStageInVars())
@@ -1353,6 +1497,12 @@ std::vector<SpirvVariable *> DeclResultIdMapper::collectStageVars() const {
 
   llvm::DenseSet<SpirvInstruction *> seenVars;
   for (const auto &var : stageVars) {
+    // We must collect stage variables that are included in entryPoint and stage
+    // variables that are not included in any specific entryPoint i.e.,
+    // var.getEntryPoint() is nullptr. Note that stage variables without any
+    // specific entry point are common stage variables among all entry points.
+    if (var.getEntryPoint() && var.getEntryPoint() != entryPoint)
+      continue;
     auto *instr = var.getSpirvInstr();
     if (seenVars.count(instr) == 0) {
       vars.push_back(instr);
@@ -1488,7 +1638,9 @@ private:
 } // namespace
 
 bool DeclResultIdMapper::checkSemanticDuplication(bool forInput) {
-  llvm::StringSet<> seenSemantics;
+  // Mapping from entry points to the corresponding set of semantics.
+  llvm::SmallDenseMap<SpirvFunction *, llvm::StringSet<>>
+      seenSemanticsForEntryPoints;
   bool success = true;
   for (const auto &var : stageVars) {
     auto s = var.getSemanticStr();
@@ -1508,17 +1660,19 @@ bool DeclResultIdMapper::checkSemanticDuplication(bool forInput) {
       continue;
 
     if (forInput && var.getSigPoint()->IsInput()) {
-      if (seenSemantics.count(s)) {
+      bool insertionSuccess = insertSeenSemanticsForEntryPointIfNotExist(
+          &seenSemanticsForEntryPoints, var.getEntryPoint(), s);
+      if (!insertionSuccess) {
         emitError("input semantic '%0' used more than once", {}) << s;
         success = false;
       }
-      seenSemantics.insert(s);
     } else if (!forInput && var.getSigPoint()->IsOutput()) {
-      if (seenSemantics.count(s)) {
+      bool insertionSuccess = insertSeenSemanticsForEntryPointIfNotExist(
+          &seenSemanticsForEntryPoints, var.getEntryPoint(), s);
+      if (!insertionSuccess) {
         emitError("output semantic '%0' used more than once", {}) << s;
         success = false;
       }
-      seenSemantics.insert(s);
     }
   }
 
@@ -2102,8 +2256,6 @@ bool DeclResultIdMapper::createStageVars(
     // * SV_DispatchThreadID, SV_GroupThreadID, and SV_GroupID are allowed to be
     //   uint, uint2, or uint3, but the corresponding builtins
     //   (GlobalInvocationId, LocalInvocationId, WorkgroupId) must be a uint3.
-    // * SV_ShadingRate is a uint value, but the builtin it corresponds to is a
-    //   int2.
 
     if (glPerVertex.tryToAccess(sigPointKind, semanticKind,
                                 semanticToUse->index, invocationId, value,
@@ -2145,9 +2297,6 @@ bool DeclResultIdMapper::createStageVars(
           hlsl::IsHLSLVecType(type) ? hlsl::GetHLSLVecElementType(type) : type,
           3);
       break;
-    case hlsl::Semantic::Kind::ShadingRate:
-      evalType = astContext.getExtVectorType(astContext.IntTy, 2);
-      break;
     default:
       // Only the semantic kinds mentioned above are handled.
       break;
@@ -2179,6 +2328,10 @@ bool DeclResultIdMapper::createStageVars(
     stageVar.setSpirvInstr(varInstr);
     stageVar.setLocationAttr(decl->getAttr<VKLocationAttr>());
     stageVar.setIndexAttr(decl->getAttr<VKIndexAttr>());
+    if (stageVar.getStorageClass() == spv::StorageClass::Input ||
+        stageVar.getStorageClass() == spv::StorageClass::Output) {
+      stageVar.setEntryPoint(entryFunction);
+    }
     stageVars.push_back(stageVar);
 
     // Emit OpDecorate* instructions to link this stage variable with the HLSL
@@ -2213,7 +2366,8 @@ bool DeclResultIdMapper::createStageVars(
     //   invocation. BaseInstance is the firstInstance parameter to a direct
     //   drawing command or the firstInstance member of a structure consumed by
     //   an indirect drawing command.
-    if (asInput && semanticKind == hlsl::Semantic::Kind::InstanceID &&
+    if (spirvOptions.supportNonzeroBaseInstance && asInput &&
+        semanticKind == hlsl::Semantic::Kind::InstanceID &&
         sigPointKind == hlsl::SigPoint::Kind::VSIn) {
       // The above call to createSpirvStageVar creates the gl_InstanceIndex.
       // We should now manually create the gl_BaseInstance variable and do the
@@ -2384,25 +2538,6 @@ bool DeclResultIdMapper::createStageVars(
           *value = spvBuilder.createVectorShuffle(
               astContext.getExtVectorType(srcVecElemType, 2), *value, *value,
               {0, 1}, thisSemantic.loc);
-      }
-      // Special handling of SV_ShadingRate, which is a bitpacked enum value,
-      // but SPIR-V's FragSizeEXT uses an int2. We build the enum value from
-      // the separate axis values.
-      else if (semanticKind == hlsl::Semantic::Kind::ShadingRate) {
-        // From the D3D12 functional spec for Variable-Rate Shading.
-        // #define D3D12_MAKE_COARSE_SHADING_RATE(x,y) ((x) << 2 | (y))
-        const auto x = spvBuilder.createCompositeExtract(
-            astContext.IntTy, *value, {0}, thisSemantic.loc);
-        const auto y = spvBuilder.createCompositeExtract(
-            astContext.IntTy, *value, {1}, thisSemantic.loc);
-        const auto constTwo =
-            spvBuilder.getConstantInt(astContext.IntTy, llvm::APInt(32, 2));
-        *value = spvBuilder.createBinaryOp(
-            spv::Op::OpBitwiseOr, astContext.UnsignedIntTy,
-            spvBuilder.createBinaryOp(spv::Op::OpShiftLeftLogical,
-                                      astContext.IntTy, x, constTwo,
-                                      thisSemantic.loc),
-            y, thisSemantic.loc);
       }
 
       // Reciprocate SV_Position.w if requested
@@ -2666,6 +2801,10 @@ bool DeclResultIdMapper::createPayloadStageVars(
     // assignment.
     stageVar.setIsSpirvBuiltin();
     stageVar.setSpirvInstr(varInstr);
+    if (stageVar.getStorageClass() == spv::StorageClass::Input ||
+        stageVar.getStorageClass() == spv::StorageClass::Output) {
+      stageVar.setEntryPoint(entryFunction);
+    }
     stageVars.push_back(stageVar);
 
     // Decorate with PerTaskNV for mesh/amplification shader payload variables.
@@ -2967,6 +3106,10 @@ SpirvVariable *DeclResultIdMapper::createSpirvIntermediateOutputStageVar(
   stageVar.setSpirvInstr(varInstr);
   stageVar.setLocationAttr(decl->getAttr<VKLocationAttr>());
   stageVar.setIndexAttr(decl->getAttr<VKIndexAttr>());
+  if (stageVar.getStorageClass() == spv::StorageClass::Input ||
+      stageVar.getStorageClass() == spv::StorageClass::Output) {
+    stageVar.setEntryPoint(entryFunction);
+  }
   stageVars.push_back(stageVar);
 
   // Emit OpDecorate* instructions to link this stage variable with the HLSL
@@ -3352,16 +3495,30 @@ SpirvVariable *DeclResultIdMapper::createSpirvStageVar(
   }
   // According to DXIL spec, the ShadingRate SV can only be used by GSOut,
   // VSOut, or PSIn. According to Vulkan spec, the FragSizeEXT BuiltIn can only
-  // be used as PSIn.
+  // be used as VSOut, GSOut, MSOut or PSIn.
   case hlsl::Semantic::Kind::ShadingRate: {
+    QualType checkType = type->getAs<ReferenceType>()
+                             ? type->getAs<ReferenceType>()->getPointeeType()
+                             : type;
+    QualType scalarTy;
+    if (!isScalarType(checkType, &scalarTy) || !scalarTy->isIntegerType()) {
+      emitError("semantic ShadingRate must be interger scalar type", srcLoc);
+    }
+
     switch (sigPointKind) {
     case hlsl::SigPoint::Kind::PSIn:
       stageVar->setIsSpirvBuiltin();
-      return spvBuilder.addStageBuiltinVar(type, sc, BuiltIn::FragSizeEXT,
+      return spvBuilder.addStageBuiltinVar(type, sc, BuiltIn::ShadingRateKHR,
                                            isPrecise, srcLoc);
+    case hlsl::SigPoint::Kind::VSOut:
+    case hlsl::SigPoint::Kind::GSOut:
+    case hlsl::SigPoint::Kind::MSOut:
+      stageVar->setIsSpirvBuiltin();
+      return spvBuilder.addStageBuiltinVar(
+          type, sc, BuiltIn::PrimitiveShadingRateKHR, isPrecise, srcLoc);
     default:
-      emitError("semantic ShadingRate currently unsupported in non-PS shader"
-                " stages",
+      emitError("semantic ShadingRate must be used only for PSIn, VSOut, "
+                "GSOut, MSOut",
                 srcLoc);
       break;
     }

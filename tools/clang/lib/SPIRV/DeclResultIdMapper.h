@@ -56,7 +56,7 @@ public:
       : sigPoint(sig), semanticInfo(std::move(semaInfo)), builtinAttr(builtin),
         type(astType), value(nullptr), isBuiltin(false),
         storageClass(spv::StorageClass::Max), location(nullptr),
-        locationCount(locCount) {
+        locationCount(locCount), entryPoint(nullptr) {
     isBuiltin = builtinAttr != nullptr;
   }
 
@@ -85,6 +85,9 @@ public:
 
   uint32_t getLocationCount() const { return locationCount; }
 
+  SpirvFunction *getEntryPoint() const { return entryPoint; }
+  void setEntryPoint(SpirvFunction *entry) { entryPoint = entry; }
+
 private:
   /// HLSL SigPoint. It uniquely identifies each set of parameters that may be
   /// input or output for each entry point.
@@ -107,6 +110,9 @@ private:
   const VKIndexAttr *indexAttr;
   /// How many locations this stage variable takes.
   uint32_t locationCount;
+  /// Entry point for this stage variable. If this stage variable is not
+  /// specific for an entry point e.g., built-in, it must be nullptr.
+  SpirvFunction *entryPoint;
 };
 
 class ResourceVar {
@@ -416,10 +422,20 @@ public:
                                               const QualType retType,
                                               uint32_t numOutputControlPoints);
 
+  /// \brief An enum class for representing what the DeclContext is used for
+  enum class ContextUsageKind {
+    CBuffer,
+    TBuffer,
+    PushConstant,
+    Globals,
+    ShaderRecordBufferNV,
+    ShaderRecordBufferEXT
+  };
+
   /// Raytracing specific functions
-  /// \brief Creates a ShaderRecordBufferNV block from the given decl.
-  SpirvVariable *createShaderRecordBufferNV(const VarDecl *decl);
-  SpirvVariable *createShaderRecordBufferNV(const HLSLBufferDecl *decl);
+  /// \brief Creates a ShaderRecordBufferEXT or ShaderRecordBufferNV block from the given decl.
+  SpirvVariable *createShaderRecordBuffer(const VarDecl *decl, ContextUsageKind kind);
+  SpirvVariable *createShaderRecordBuffer(const HLSLBufferDecl *decl, ContextUsageKind kind);
 
 private:
   /// The struct containing SPIR-V information of a AST Decl.
@@ -442,6 +458,16 @@ private:
   /// \brief Returns the SPIR-V information for the given decl.
   /// Returns nullptr if no such decl was previously registered.
   const DeclSpirvInfo *getDeclSpirvInfo(const ValueDecl *decl) const;
+
+  /// \brief Creates DeclSpirvInfo using the given instr and index. It creates a
+  /// clone variable if it is CTBuffer including matrix 1xN with FXC memory
+  /// layout.
+  DeclSpirvInfo createDeclSpirvInfo(SpirvInstruction *instr,
+                                    int index = -1) const {
+    if (auto *clone = spvBuilder.initializeCloneVarForFxcCTBuffer(instr))
+      instr = clone;
+    return DeclSpirvInfo(instr, index);
+  }
 
 public:
   /// \brief Returns the information for the given decl.
@@ -486,9 +512,10 @@ public:
   /// won't attach Block/BufferBlock decoration.
   const SpirvType *getCTBufferPushConstantType(const DeclContext *decl);
 
-  /// \brief Returns all defined stage (builtin/input/ouput) variables in this
-  /// mapper.
-  std::vector<SpirvVariable *> collectStageVars() const;
+  /// \brief Returns all defined stage (builtin/input/ouput) variables for the
+  /// entry point function entryPoint in this mapper.
+  std::vector<SpirvVariable *>
+  collectStageVars(SpirvFunction *entryPoint) const;
 
   /// \brief Writes out the contents in the function parameter for the GS
   /// stream output to the corresponding stage output variables in a recursive
@@ -599,15 +626,6 @@ private:
   /// This method will write the location assignment into the module under
   /// construction.
   bool finalizeStageIOLocations(bool forInput);
-
-  /// \brief An enum class for representing what the DeclContext is used for
-  enum class ContextUsageKind {
-    CBuffer,
-    TBuffer,
-    PushConstant,
-    Globals,
-    ShaderRecordBufferNV,
-  };
 
   /// Creates a variable of struct type with explicit layout decorations.
   /// The sub-Decls in the given DeclContext will be treated as the struct
@@ -785,6 +803,7 @@ private:
   /// Mapping of all Clang AST decls to their instruction pointers.
   llvm::DenseMap<const ValueDecl *, DeclSpirvInfo> astDecls;
   llvm::DenseMap<const ValueDecl *, SpirvFunction *> astFunctionDecls;
+
   /// Vector of all defined stage variables.
   llvm::SmallVector<StageVar, 8> stageVars;
   /// Mapping from Clang AST decls to the corresponding stage variables.

@@ -20,6 +20,7 @@
 #include "dxc/dxcapi.h"
 #include "dxc/Support/SPIRVOptions.h"
 #include <map>
+#include <set>
 
 namespace llvm {
 namespace opt {
@@ -133,6 +134,7 @@ public:
   unsigned DefaultTextCodePage = DXC_CP_UTF8; // OPT_encoding
 
   bool AllResourcesBound = false; // OPT_all_resources_bound
+  bool IgnoreOptSemDefs = false; // OPT_ignore_opt_semdefs
   bool AstDump = false; // OPT_ast_dump
   bool ColorCodeAssembly = false; // OPT_Cc
   bool CodeGenHighLevel = false; // OPT_fcgl
@@ -141,6 +143,7 @@ public:
   bool DebugNameForBinary = false; // OPT_Zsb
   bool DebugNameForSource = false; // OPT_Zss
   bool DumpBin = false;        // OPT_dumpbin
+  bool Link = false;        // OPT_link
   bool WarningAsError = false; // OPT__SLASH_WX
   bool IEEEStrict = false;     // OPT_Gis
   bool IgnoreLineDirectives = false; // OPT_ignore_line_directives
@@ -172,9 +175,9 @@ public:
   bool RecompileFromBinary = false; // OPT _Recompile (Recompiling the DXBC binary file not .hlsl file)
   bool StripDebug = false; // OPT Qstrip_debug
   bool EmbedDebug = false; // OPT Qembed_debug
-  bool SourceInDebugModule = false; // OPT Qsource_in_debug_module
+  bool SourceInDebugModule = false; // OPT Zs
   bool SourceOnlyDebug = false; // OPT Qsource_only_debug
-  bool FullDebug = false; // OPT Qfull_debug
+  bool PdbInPrivate = false; // OPT Qpdb_in_private
   bool StripRootSignature = false; // OPT_Qstrip_rootsignature
   bool StripPrivate = false; // OPT_Qstrip_priv
   bool StripReflection = false; // OPT_Qstrip_reflect
@@ -199,7 +202,12 @@ public:
   std::map<std::string, bool> DxcOptimizationToggles; // OPT_opt_enable & OPT_opt_disable
   std::map<std::string, std::string> DxcOptimizationSelects; // OPT_opt_select
 
+  std::set<std::string> IgnoreSemDefs; // OPT_ignore_semdef
+  std::map<std::string, std::string> OverrideSemDefs; // OPT_override_semdef
+
   bool PrintAfterAll; // OPT_print_after_all
+  bool EnablePayloadQualifiers = false; // OPT_enable_payload_qualifiers
+  bool HandleExceptions = false; // OPT_disable_exception_handling
 
   // Rewriter Options
   RewriterOpts RWOpt;
@@ -210,7 +218,8 @@ public:
   bool IsLibraryProfile();
 
   // Helpers to clarify interpretation of flags for behavior in implementation
-  bool IsDebugInfoEnabled();    // Zi
+  bool GenerateFullDebugInfo(); // Zi
+  bool GeneratePDB();           // Zi or Zs
   bool EmbedDebugInfo();        // Qembed_debug
   bool EmbedPDBName();          // Zi or Fd
   bool DebugFileIsDirectory();  // Fd ends in '\\'

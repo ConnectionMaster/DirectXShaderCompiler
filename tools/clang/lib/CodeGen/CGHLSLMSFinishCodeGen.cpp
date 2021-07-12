@@ -20,6 +20,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
+#include "llvm/IR/DerivedTypes.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 
@@ -292,6 +293,35 @@ void ReplaceBoolVectorSubscript(Function *F) {
   }
 }
 
+// Returns a valid field annotation (if present) for the matrix type of templated
+// resource on matrix type.
+// Example:-
+// AppendStructuredBuffer<float4x4> abuf;
+// Return the field annotation of the matrix type in the above decl.
+static DxilFieldAnnotation* GetTemplatedResMatAnnotation(Function *F, unsigned argOpIdx,
+  unsigned matAnnotationIdx) {
+  for (User* U : F->users()) {
+    if (CallInst* CI = dyn_cast<CallInst>(U)) {
+      if (argOpIdx >= CI->getNumArgOperands())
+        continue;
+      Value *resArg = CI->getArgOperand(argOpIdx);
+      Type* resArgTy = resArg->getType();
+      if (resArgTy->isPointerTy())
+        resArgTy = cast<PointerType>(resArgTy)->getPointerElementType();
+      if (isa<StructType>(resArgTy)) {
+        DxilTypeSystem& TS = F->getParent()->GetHLModule().GetTypeSystem();
+        auto *SA = TS.GetStructAnnotation(cast<StructType>(resArgTy));
+        auto *FA = &(SA->GetFieldAnnotation(matAnnotationIdx));
+        if (FA && FA->HasMatrixAnnotation()) {
+          return FA;
+        }
+      }
+    }
+  }
+
+  return nullptr;
+}
+
 // Add function body for intrinsic if possible.
 Function *CreateOpFunction(llvm::Module &M, Function *F,
                            llvm::FunctionType *funcTy, HLOpcodeGroup group,
@@ -370,6 +400,10 @@ Function *CreateOpFunction(llvm::Module &M, Function *F,
       Value *subscript =
           Builder.CreateCall(subscriptFunc, {subscriptOpArg, thisArg, counter});
 
+      constexpr unsigned kArgIdx = 0;
+      constexpr unsigned kMatAnnotationIdx = 0;
+      DxilFieldAnnotation* MatAnnotation = HLMatrixType::isa(valTy) ? 
+        GetTemplatedResMatAnnotation(F, kArgIdx, kMatAnnotationIdx) : nullptr;
       if (bAppend) {
         Argument *valArg = argIter;
         // Buf[counter] = val;
@@ -377,8 +411,53 @@ Function *CreateOpFunction(llvm::Module &M, Function *F,
           unsigned size = M.getDataLayout().getTypeAllocSize(
               subscript->getType()->getPointerElementType());
           Builder.CreateMemCpy(subscript, valArg, size, 1);
-        } else {
-          Value *storedVal = valArg;
+        } else if (MatAnnotation) {
+          // If the to-be-stored value is a matrix then we need to generate
+          // an HL matrix store which is then handled appropriately in HLMatrixLowerPass.
+          bool isRowMajor = MatAnnotation->GetMatrixAnnotation().Orientation == MatrixOrientation::RowMajor;
+          Value* matStoreVal = valArg;
+
+          // The in-reg matrix orientation is always row-major.
+          // If the in-memory matrix orientation is col-major, then we
+          // need to change the orientation to col-major before storing
+          // to memory
+          if (!isRowMajor) {
+            unsigned castOpCode = (unsigned)HLCastOpcode::RowMatrixToColMatrix;
+
+            // Construct signature of the function that is used for converting
+            // orientation of a matrix from row-major to col-major.
+            FunctionType* MatCastFnType = FunctionType::get(
+              matStoreVal->getType(), { Builder.getInt32Ty(), matStoreVal->getType() },
+              /* isVarArg */ false);
+
+            // Create the conversion function.
+            Function* MatCastFn = GetOrCreateHLFunction(
+              M, MatCastFnType, HLOpcodeGroup::HLCast, castOpCode);
+            Value* MatCastOpCode = ConstantInt::get(Builder.getInt32Ty(), castOpCode);
+
+            // Insert call to the conversion function.
+            matStoreVal = Builder.CreateCall(MatCastFn, { MatCastOpCode, matStoreVal });
+          }
+
+          unsigned storeOpCode = isRowMajor ? (unsigned) HLMatLoadStoreOpcode::RowMatStore
+            : (unsigned) HLMatLoadStoreOpcode::ColMatStore;
+
+          // Construct signature of the function that is used for storing
+          // the matrix value to the memory.
+          FunctionType* MatStFnType = FunctionType::get(
+            Builder.getVoidTy(), { Builder.getInt32Ty(), subscriptTy, matStoreVal->getType() },
+            /* isVarArg */ false);
+
+          // Create the matrix store function.
+          Function* MatStFn = GetOrCreateHLFunction(
+            M, MatStFnType, HLOpcodeGroup::HLMatLoadStore, storeOpCode);
+          Value* MatStOpCode = ConstantInt::get(Builder.getInt32Ty(), storeOpCode);
+
+          // Insert call to the matrix store function.
+          Builder.CreateCall(MatStFn, { MatStOpCode, subscript, matStoreVal });
+        }
+        else {
+          Value* storedVal = valArg;
           // Convert to memory representation
           if (isBoolScalarOrVector)
             storedVal = Builder.CreateZExt(
@@ -390,6 +469,51 @@ Function *CreateOpFunction(llvm::Module &M, Function *F,
         // return Buf[counter];
         if (valTy->isPointerTy())
           Builder.CreateRet(subscript);
+        else if (MatAnnotation) {
+          // If the to-be-loaded value is a matrix then we need to generate
+          // an HL matrix load which is then handled appropriately in HLMatrixLowerPass.
+          bool isRowMajor = MatAnnotation->GetMatrixAnnotation().Orientation == MatrixOrientation::RowMajor;
+
+          unsigned loadOpCode = isRowMajor ? (unsigned)HLMatLoadStoreOpcode::RowMatLoad
+            : (unsigned)HLMatLoadStoreOpcode::ColMatLoad;
+
+          // Construct signature of the function that is used for loading
+          // the matrix value from the memory.
+          FunctionType* MatLdFnType = FunctionType::get(valTy, { Builder.getInt32Ty(), subscriptTy },
+            /* isVarArg */ false);
+
+          // Create the matrix load function.
+          Function* MatLdFn = GetOrCreateHLFunction(
+            M, MatLdFnType, HLOpcodeGroup::HLMatLoadStore, loadOpCode);
+          Value* MatStOpCode = ConstantInt::get(Builder.getInt32Ty(), loadOpCode);
+
+          // Insert call to the matrix load function.
+          Value *matLdVal = Builder.CreateCall(MatLdFn, { MatStOpCode, subscript });
+
+          // The in-reg matrix orientation is always row-major.
+          // If the in-memory matrix orientation is col-major, then we
+          // need to change the orientation to row-major after loading
+          // from memory.
+          if (!isRowMajor) {
+            unsigned castOpCode = (unsigned)HLCastOpcode::ColMatrixToRowMatrix;
+
+            // Construct signature of the function that is used for converting
+            // orientation of a matrix from col-major to row-major.
+            FunctionType* MatCastFnType = FunctionType::get(
+              matLdVal->getType(), { Builder.getInt32Ty(), matLdVal->getType() },
+              /* isVarArg */ false);
+
+            // Create the conversion function.
+            Function* MatCastFn = GetOrCreateHLFunction(
+              M, MatCastFnType, HLOpcodeGroup::HLCast, castOpCode);
+            Value* MatCastOpCode = ConstantInt::get(Builder.getInt32Ty(), castOpCode);
+
+            // Insert call to the conversion function.
+            matLdVal = Builder.CreateCall(MatCastFn, { MatCastOpCode, matLdVal });
+
+          }
+          Builder.CreateRet(matLdVal);
+        }
         else {
           Value *retVal = Builder.CreateLoad(subscript);
           // Convert to register representation
@@ -530,18 +654,24 @@ void AddOpcodeParamForIntrinsic(
   // Add the opcode param
   llvm::Type *opcodeTy = llvm::Type::getInt32Ty(M.getContext());
   paramTyList.emplace_back(opcodeTy);
-  paramTyList.append(oldFuncTy->param_begin(), oldFuncTy->param_end());
 
-  for (unsigned i = 1; i < paramTyList.size(); i++) {
-    llvm::Type *Ty = paramTyList[i];
+  bool bRetHandle = false;
+  for (unsigned i = 0; i < oldFuncTy->getNumParams(); i++) {
+    llvm::Type *Ty = oldFuncTy->getParamType(i);
     if (Ty->isPointerTy()) {
-      Ty = Ty->getPointerElementType();
-      if (dxilutil::IsHLSLResourceType(Ty)) {
+      llvm::Type *PtrEltTy = Ty->getPointerElementType();
+      if (dxilutil::IsHLSLResourceType(PtrEltTy)) {
+        // Skip for return type.
+        if (i == 0 && F->arg_begin()->hasStructRetAttr()) {
+          bRetHandle = true;
+          continue;
+        }
         // Use handle type for resource type.
         // This will make sure temp object variable only used by createHandle.
-        paramTyList[i] = HandleTy;
+        Ty = HandleTy;
       }
     }
+    paramTyList.emplace_back(Ty);
   }
 
   HLOpcodeGroup group = hlsl::GetHLOpcodeGroup(F);
@@ -570,7 +700,10 @@ void AddOpcodeParamForIntrinsic(
       opcode == static_cast<unsigned>(HLSubscriptOpcode::DoubleSubscript);
 
   llvm::Type *RetTy = oldFuncTy->getReturnType();
-
+  if (bRetHandle) {
+    DXASSERT(RetTy->isVoidTy(), "else invalid return type");
+    RetTy = HandleTy;
+  }
   if (isDoubleSubscriptFunc) {
     CallInst *doubleSub = cast<CallInst>(*F->user_begin());
 
@@ -630,9 +763,16 @@ void AddOpcodeParamForIntrinsic(
     SmallVector<Value *, 4> opcodeParamList;
     Value *opcodeConst = Constant::getIntegerValue(opcodeTy, APInt(32, opcode));
     opcodeParamList.emplace_back(opcodeConst);
-
-    opcodeParamList.append(oldCI->arg_operands().begin(),
-                           oldCI->arg_operands().end());
+    Value *retHandleArg = nullptr;
+    if (!bRetHandle) {
+      opcodeParamList.append(oldCI->arg_operands().begin(),
+                             oldCI->arg_operands().end());
+    } else {
+      auto it = oldCI->arg_operands().begin();
+      retHandleArg = *(it++);
+      opcodeParamList.append(it,
+                             oldCI->arg_operands().end());
+    }
     IRBuilder<> Builder(oldCI);
 
     if (isDoubleSubscriptFunc) {
@@ -688,7 +828,6 @@ void AddOpcodeParamForIntrinsic(
       if (Ty->isPointerTy()) {
         Ty = Ty->getPointerElementType();
         if (dxilutil::IsHLSLResourceType(Ty)) {
-
           DxilResourceProperties RP = GetResourcePropsFromIntrinsicObjectArg(
               arg, HLM, typeSys, objectProperties);
           // Use object type directly, not by pointer.
@@ -713,6 +852,15 @@ void AddOpcodeParamForIntrinsic(
     }
 
     Value *CI = Builder.CreateCall(opFunc, opcodeParamList);
+    if (retHandleArg) {
+      Type *ResTy = retHandleArg->getType()->getPointerElementType();
+      Value *Res = HLM.EmitHLOperationCall(
+          Builder, HLOpcodeGroup::HLCast,
+          (unsigned)HLCastOpcode::HandleToResCast, ResTy, {CI}, M);
+      Builder.CreateStore(Res, retHandleArg);
+      oldCI->eraseFromParent();
+      continue;
+    }
     if (!isDoubleSubscriptFunc) {
       // replace new call and delete the old call
       oldCI->replaceAllUsesWith(CI);
@@ -1336,6 +1484,10 @@ typedef APInt(__cdecl *IntBinaryEvalFuncType)(const APInt &, const APInt &);
 typedef float(__cdecl *FloatBinaryEvalFuncType)(float, float);
 typedef double(__cdecl *DoubleBinaryEvalFuncType)(double, double);
 
+typedef APInt(__cdecl *IntTernaryEvalFuncType)(const APInt &, const APInt &, const APInt &);
+typedef float(__cdecl *FloatTernaryEvalFuncType)(float, float, float);
+typedef double(__cdecl *DoubleTernaryEvalFuncType)(double, double, double);
+
 Value *EvalUnaryIntrinsic(ConstantFP *fpV, FloatUnaryEvalFuncType floatEvalFunc,
                           DoubleUnaryEvalFuncType doubleEvalFunc) {
   llvm::Type *Ty = fpV->getType();
@@ -1381,6 +1533,45 @@ Value *EvalBinaryIntrinsic(Constant *cV0, Constant *cV1,
     const APInt &iV0 = ciV0->getValue();
     const APInt &iV1 = ciV1->getValue();
     Value *dResult = ConstantInt::get(Ty, intEvalFunc(iV0, iV1));
+    Result = dResult;
+  }
+  return Result;
+}
+
+Value *EvalTernaryIntrinsic(Constant *cV0, Constant *cV1, Constant *cV2,
+                             FloatTernaryEvalFuncType floatEvalFunc,
+                             DoubleTernaryEvalFuncType doubleEvalFunc,
+                             IntTernaryEvalFuncType intEvalFunc) {
+  llvm::Type *Ty = cV0->getType();
+  Value *Result = nullptr;
+  if (Ty->isDoubleTy()) {
+    ConstantFP *fpV0 = cast<ConstantFP>(cV0);
+    ConstantFP *fpV1 = cast<ConstantFP>(cV1);
+    ConstantFP *fpV2 = cast<ConstantFP>(cV2);
+    double dV0 = fpV0->getValueAPF().convertToDouble();
+    double dV1 = fpV1->getValueAPF().convertToDouble();
+    double dV2 = fpV2->getValueAPF().convertToDouble();
+    Value *dResult = ConstantFP::get(Ty, doubleEvalFunc(dV0, dV1, dV2));
+    Result = dResult;
+  } else if (Ty->isFloatTy()) {
+    ConstantFP *fpV0 = cast<ConstantFP>(cV0);
+    ConstantFP *fpV1 = cast<ConstantFP>(cV1);
+    ConstantFP *fpV2 = cast<ConstantFP>(cV2);
+    float fV0 = fpV0->getValueAPF().convertToFloat();
+    float fV1 = fpV1->getValueAPF().convertToFloat();
+    float fV2 = fpV2->getValueAPF().convertToFloat();
+    Value *dResult = ConstantFP::get(Ty, floatEvalFunc(fV0, fV1, fV2));
+    Result = dResult;
+  } else {
+    DXASSERT_NOMSG(Ty->isIntegerTy());
+    DXASSERT_NOMSG(intEvalFunc);
+    ConstantInt *ciV0 = cast<ConstantInt>(cV0);
+    ConstantInt *ciV1 = cast<ConstantInt>(cV1);
+    ConstantInt *ciV2 = cast<ConstantInt>(cV2);
+    const APInt &iV0 = ciV0->getValue();
+    const APInt &iV1 = ciV1->getValue();
+    const APInt &iV2 = ciV2->getValue();
+    Value *dResult = ConstantInt::get(Ty, intEvalFunc(iV0, iV1, iV2));
     Result = dResult;
   }
   return Result;
@@ -1432,6 +1623,43 @@ Value *EvalBinaryIntrinsic(CallInst *CI, FloatBinaryEvalFuncType floatEvalFunc,
     Constant *cV0 = cast<Constant>(V0);
     Constant *cV1 = cast<Constant>(V1);
     Result = EvalBinaryIntrinsic(cV0, cV1, floatEvalFunc, doubleEvalFunc,
+                                 intEvalFunc);
+  }
+  CI->replaceAllUsesWith(Result);
+  CI->eraseFromParent();
+  return Result;
+
+  CI->eraseFromParent();
+  return Result;
+}
+
+Value *EvalTernaryIntrinsic(CallInst *CI, FloatTernaryEvalFuncType floatEvalFunc,
+                             DoubleTernaryEvalFuncType doubleEvalFunc,
+                             IntTernaryEvalFuncType intEvalFunc = nullptr) {
+  Value *V0 = CI->getArgOperand(0);
+  Value *V1 = CI->getArgOperand(1);
+  Value *V2 = CI->getArgOperand(2);
+  llvm::Type *Ty = CI->getType();
+  Value *Result = nullptr;
+  if (llvm::VectorType *VT = dyn_cast<llvm::VectorType>(Ty)) {
+    Result = UndefValue::get(Ty);
+    Constant *CV0 = cast<Constant>(V0);
+    Constant *CV1 = cast<Constant>(V1);
+    Constant *CV2 = cast<Constant>(V2);
+    IRBuilder<> Builder(CI);
+    for (unsigned i = 0; i < VT->getNumElements(); i++) {
+      Constant *cV0 = cast<Constant>(CV0->getAggregateElement(i));
+      Constant *cV1 = cast<Constant>(CV1->getAggregateElement(i));
+      Constant *cV2 = cast<Constant>(CV2->getAggregateElement(i));
+      Value *EltResult = EvalTernaryIntrinsic(cV0, cV1, cV2, floatEvalFunc,
+                                             doubleEvalFunc, intEvalFunc);
+      Result = Builder.CreateInsertElement(Result, EltResult, i);
+    }
+  } else {
+    Constant *cV0 = cast<Constant>(V0);
+    Constant *cV1 = cast<Constant>(V1);
+    Constant *cV2 = cast<Constant>(V2);
+    Result = EvalTernaryIntrinsic(cV0, cV1, cV2, floatEvalFunc, doubleEvalFunc,
                                  intEvalFunc);
   }
   CI->replaceAllUsesWith(Result);
@@ -1665,6 +1893,18 @@ Value *TryEvalIntrinsic(CallInst *CI, IntrinsicOp intriOp,
     CI->eraseFromParent();
     return cNan;
   } break;
+  case IntrinsicOp::IOP_clamp: {
+    auto clampF = [](float a, float b, float c) {
+      return a < b ? b : a > c ? c : a;
+    };
+    auto clampD = [](double a, double b, double c) {
+      return a < b ? b : a > c ? c : a;
+    };
+    auto clampI = [](const APInt &a, const APInt &b, const APInt &c) -> APInt {
+      return a.slt(b) ? b : a.sgt(c) ? c : a;
+    };
+    return EvalTernaryIntrinsic(CI, clampF, clampD, clampI);
+  } break;
   default:
     return nullptr;
   }
@@ -1744,6 +1984,10 @@ unsigned AlignCBufferOffset(unsigned offset, unsigned size, llvm::Type *Ty,
                             bool bRowMajor, bool bMinPrecMode,
                             bool &bCurRowIsMinPrec) {
   DXASSERT(!(offset & 1), "otherwise we have an invalid offset.");
+  // resources, empty structure, or structures with only resources have
+  // zero size, and need no alignment.
+  if (size == 0)
+    return offset;
   bool bNeedNewRow = Ty->isArrayTy();
   // In min-precision mode, a new row is needed when
   // going into or out of min-precision component type.
@@ -1837,8 +2081,67 @@ void AllocateDxilConstantBuffers(
 
 namespace {
 
+// Instruction pointer wrapper that cleans up the instruction if unused
+template<typename _InstructionT>
+struct CleanupIfUnused {
+  _InstructionT *I = nullptr;
+  CleanupIfUnused(Value *V) {
+    if (V)
+      I = cast<_InstructionT>(V);
+  }
+  ~CleanupIfUnused() {
+    if (I && I->user_empty())
+      I->eraseFromParent();
+    I = nullptr;
+  }
+  operator _InstructionT*() { return I; }
+  _InstructionT *operator->() { return I; }
+  operator bool() { return I != nullptr; }
+};
+
+// When replacing CBV use, it's possible for the resource itself to be used,
+// in which case we need to either use a cast from handle back to the resource
+// type, or if it's a pointer, use an alloca where that casted resource is
+// stored.
+// Later we will mutate the original resource type to a handle type,
+// and eliminate this cast.
+// This helper produces the cast and a store to new alloca in case either a
+// value or a pointer to the original resource type is needed, and cleans up any
+// unused instructions afterward.
+// Instructions are only produced if hlResTy is non-null, indicating
+// ConstantBuffer<> object type rather than legacy cbuffer type that has no
+// resource object.
+struct HandleToResHelper {
+  HandleToResHelper(IRBuilder<> &Builder, Type *hlResTy, Value* Handle, Function &F, HLModule &HLM) {
+    if (hlResTy) {
+      Cast = cast<CallInst>(HLM.EmitHLOperationCall(
+          Builder, HLOpcodeGroup::HLCast, (unsigned)HLCastOpcode::HandleToResCast,
+          hlResTy, {Handle}, *HLM.GetModule()));
+      IRBuilder<>  AllocaBuilder(F.getEntryBlock().getFirstInsertionPt());
+      Alloca = AllocaBuilder.CreateAlloca(hlResTy);
+      Store = Builder.CreateStore(Cast, Alloca);
+    }
+  }
+  ~HandleToResHelper() {
+    if (Alloca && Alloca->hasOneUse()) {
+      Store->eraseFromParent();
+      Alloca->eraseFromParent();
+      if (Cast->user_empty())
+        Cast->eraseFromParent();
+    }
+  }
+  operator bool() { return Store != nullptr; }
+
+  StoreInst *Store = nullptr;
+  AllocaInst *Alloca = nullptr;
+  CallInst *Cast = nullptr;
+};
+
 void ReplaceUseInFunction(Value *V, Value *NewV, Function *F,
-                          IRBuilder<> &Builder) {
+                          IRBuilder<> &Builder, HandleToResHelper *pH2ResHelper = nullptr) {
+  Type *VTy = V->getType()->getPointerElementType();
+  bool bIsResourceTy =
+      dxilutil::IsHLSLResourceType(VTy);
   for (auto U = V->user_begin(); U != V->user_end();) {
     User *user = *(U++);
     if (Instruction *I = dyn_cast<Instruction>(user)) {
@@ -1851,7 +2154,27 @@ void ReplaceUseInFunction(Value *V, Value *NewV, Function *F,
             continue;
           }
         }
-        I->replaceUsesOfWith(V, NewV);
+        // Only replace when type matches.
+        if (V->getType() == NewV->getType()) {
+          I->replaceUsesOfWith(V, NewV);
+          continue;
+        }
+        if (pH2ResHelper && *pH2ResHelper && bIsResourceTy) {
+          // This means CBV case, so use casted value or pointer instead.
+          if (LoadInst *LI = dyn_cast<LoadInst>(I)) {
+            Instruction *OrigPtrInst = dyn_cast<Instruction>(LI->getPointerOperand());
+            LI->replaceAllUsesWith(pH2ResHelper->Cast);
+            LI->eraseFromParent();
+            // Clean up original pointer instruction (GEP) if unused.
+            if (OrigPtrInst && OrigPtrInst->user_empty())
+              OrigPtrInst->eraseFromParent();
+            continue;
+          } else {
+            I->replaceUsesOfWith(V, pH2ResHelper->Alloca);
+            continue;
+          }
+        }
+        DXASSERT(false, "otherwise, attempting CB user replacement with mismatching type");
       }
     } else {
       // For constant operator, create local clone which use GEP.
@@ -1862,6 +2185,11 @@ void ReplaceUseInFunction(Value *V, Value *NewV, Function *F,
         ReplaceUseInFunction(GEPOp, NewGEP, F, Builder);
       } else if (GlobalVariable *GV = dyn_cast<GlobalVariable>(user)) {
         // Change the init val into NewV with Store.
+
+        // FIXME: This store needs to be placed in a new init function for
+        // this GV, rather than being placed in whichever function we happen
+        // to be iterating at this point.  Otherwise it may not actually be
+        // initialized when used from another function.
         GV->setInitializer(nullptr);
         Builder.CreateStore(NewV, GV);
       } else {
@@ -1998,6 +2326,14 @@ bool CreateCBufferVariable(HLCBuffer &CB, HLModule &HLM, llvm::Type *HandleTy) {
     MarkUsedFunctionForConst(GV, constUsedFuncList[C->GetID()]);
   }
 
+  // If ConstantBuffer<> style CBV, get resource type used for translating
+  // handles back to resource objects.
+  Type *hlResTy = nullptr;
+  if (CB.IsView()) {
+    hlResTy = CB.GetConstants().front()->GetHLSLType()->getPointerElementType();
+    hlResTy = dxilutil::StripArrayTypes(hlResTy);
+  }
+
   for (Function &F : M.functions()) {
     if (F.isDeclaration())
       continue;
@@ -2009,15 +2345,14 @@ bool CreateCBufferVariable(HLCBuffer &CB, HLModule &HLM, llvm::Type *HandleTy) {
 
     // create HL subscript to make all the use of cbuffer start from it.
     HandleArgs[HLOperandIndex::kCreateHandleResourceOpIdx - 1] = cbGV;
-    CallInst *Handle = HLM.EmitHLOperationCall(
+    CleanupIfUnused<CallInst> OrigHandle = HLM.EmitHLOperationCall(
         Builder, HLOpcodeGroup::HLCreateHandle, 0, HandleTy, HandleArgs, M);
-    CallInst *OrigHandle = Handle;
     DxilResourceProperties RP = resource_helper::loadPropsFromResourceBase(&CB);
-    Handle = CreateAnnotateHandle(HLM, Handle, RP, cbGV->getType()->getElementType(), Builder);
+    CleanupIfUnused<CallInst> Handle = CreateAnnotateHandle(
+        HLM, OrigHandle, RP, cbGV->getType()->getElementType(), Builder);
 
     args[HLOperandIndex::kSubscriptObjectOpIdx] = Handle;
-    Instruction *cbSubscript =
-        cast<Instruction>(Builder.CreateCall(subscriptFunc, {args}));
+    CleanupIfUnused<Instruction> cbSubscript = Builder.CreateCall(subscriptFunc, {args});
 
     // Replace constant var with GEP pGV
     for (const std::unique_ptr<DxilResourceBase> &C : CB.GetConstants()) {
@@ -2027,14 +2362,14 @@ bool CreateCBufferVariable(HLCBuffer &CB, HLModule &HLM, llvm::Type *HandleTy) {
 
       Value *idx = indexArray[C->GetID()];
       if (!isCBArray) {
-        Instruction *GEP = cast<Instruction>(
-            Builder.CreateInBoundsGEP(cbSubscript, {zero, idx}));
+        CleanupIfUnused<Instruction> GEP =
+            Builder.CreateInBoundsGEP(cbSubscript, {zero, idx});
         // TODO: make sure the debug info is synced to GEP.
         // GEP->setDebugLoc(GV);
-        ReplaceUseInFunction(GV, GEP, &F, Builder);
-        // Delete if no use in F.
-        if (GEP->user_empty())
-          GEP->eraseFromParent();
+
+        HandleToResHelper H2ResHelper(Builder, hlResTy, Handle, F, HLM);
+        ReplaceUseInFunction(GV, GEP, &F, Builder, &H2ResHelper);
+
       } else {
         for (auto U = GV->user_begin(); U != GV->user_end();) {
           User *user = *(U++);
@@ -2078,34 +2413,28 @@ bool CreateCBufferVariable(HLCBuffer &CB, HLModule &HLM, llvm::Type *HandleTy) {
           }
 
           HandleArgs[HLOperandIndex::kCreateHandleIndexOpIdx - 1] = arrayIdx;
-          CallInst *Handle =
-
-              HLM.EmitHLOperationCall(*instBuilder,
-                                      HLOpcodeGroup::HLCreateHandle, 0,
-                                      HandleTy, HandleArgs, M);
+          CleanupIfUnused<CallInst> OrigHandle = HLM.EmitHLOperationCall(
+              *instBuilder, HLOpcodeGroup::HLCreateHandle, 0, HandleTy,
+              HandleArgs, M);
 
           DxilResourceProperties RP = resource_helper::loadPropsFromResourceBase(&CB);
-          Handle = CreateAnnotateHandle(HLM, Handle, RP, cbGV->getType()->getElementType(), *instBuilder);
+          CleanupIfUnused<CallInst> Handle = CreateAnnotateHandle(
+              HLM, OrigHandle, RP, cbGV->getType()->getElementType(), *instBuilder);
 
           args[HLOperandIndex::kSubscriptObjectOpIdx] = Handle;
           args[HLOperandIndex::kSubscriptIndexOpIdx] = arrayIdx;
 
-          Instruction *cbSubscript =
-              cast<Instruction>(instBuilder->CreateCall(subscriptFunc, {args}));
+          CleanupIfUnused<Instruction> cbSubscript =
+              instBuilder->CreateCall(subscriptFunc, {args});
+          CleanupIfUnused<Instruction> NewGEP =
+              instBuilder->CreateInBoundsGEP(cbSubscript, idxList);
 
-          Instruction *NewGEP = cast<Instruction>(
-              instBuilder->CreateInBoundsGEP(cbSubscript, idxList));
-
-          ReplaceUseInFunction(GEPOp, NewGEP, &F, *instBuilder);
+          HandleToResHelper H2ResHelper(*instBuilder, hlResTy, Handle, F, HLM);
+          ReplaceUseInFunction(GEPOp, NewGEP, &F, *instBuilder, &H2ResHelper);
         }
       }
     }
-    // Delete if no use in F.
-    if (cbSubscript->user_empty()) {
-      cbSubscript->eraseFromParent();
-      Handle->eraseFromParent();
-      OrigHandle->eraseFromParent();
-    } else {
+    if (!cbSubscript->user_empty()) {
       // merge GEP use for cbSubscript.
       HLModule::MergeGepUse(cbSubscript);
     }
@@ -2152,6 +2481,10 @@ void ConstructCBuffer(
   for (unsigned i = 0; i < HLM.GetCBuffers().size(); i++) {
     HLCBuffer &CB = *static_cast<HLCBuffer *>(&(HLM.GetCBuffer(i)));
     if (CB.GetConstants().size() == 0) {
+
+      // FIXME: Can we avoid creating a fake variable here, since this empty
+      // cbuffer presumably can't be used?
+
       // Create Fake variable for cbuffer which is empty.
       llvm::GlobalVariable *pGV = new llvm::GlobalVariable(
           *HLM.GetModule(), CBufferType, true,
@@ -2162,6 +2495,10 @@ void ConstructCBuffer(
       if (bCreated)
         ConstructCBufferAnnotation(CB, dxilTypeSys, AnnotationMap);
       else {
+
+        // FIXME: Can we avoid creating a fake variable here, since this empty
+        // cbuffer presumably can't be used?
+
         // Create Fake variable for cbuffer which is unused.
         llvm::GlobalVariable *pGV = new llvm::GlobalVariable(
             *HLM.GetModule(), CBufferType, true,
@@ -2387,6 +2724,7 @@ void CollectCtorFunctions(llvm::Module &M, llvm::StringRef globalName,
 
   DenseSet<Function *> Callers = CollectExternalFunctionCallers(M);
 
+  bool allEvaluated = true;
   for (User::op_iterator i = CA->op_begin(), e = CA->op_end(); i != e; ++i) {
     if (isa<ConstantAggregateZero>(*i))
       continue;
@@ -2407,6 +2745,7 @@ void CollectCtorFunctions(llvm::Module &M, llvm::StringRef globalName,
         // Try to build imm initilizer.
         // If not work, add global call to entry func.
         if (BuildImmInit(F) == false) {
+          allEvaluated = false;
           if (IsValidCtorFunction(F, Callers)) {
             Ctors.emplace_back(F);
           } else {
@@ -2418,6 +2757,12 @@ void CollectCtorFunctions(llvm::Module &M, llvm::StringRef globalName,
                  "else invalid Global constructor function");
       }
     }
+  }
+
+  // If all globals constructors are replaced with initializers, just get rid
+  // of the GV.
+  if (allEvaluated) {
+    GV->eraseFromParent();
   }
 }
 
@@ -2925,7 +3270,7 @@ ScopeInfo::ScopeInfo(Function *F) : maxRetLevel(0), bAllReturnsInIf(true) {
 // When all returns is inside if which is not nested, the flow is still
 // structurized even there're more than one return.
 bool ScopeInfo::CanSkipStructurize() {
-  return bAllReturnsInIf && maxRetLevel < 2;
+  return (bAllReturnsInIf && maxRetLevel < 2) || rets.size() < 2;
 }
 
 void ScopeInfo::AddScope(Scope::ScopeKind k, BasicBlock *endScopeBB) {

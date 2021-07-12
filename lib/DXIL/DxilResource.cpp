@@ -28,7 +28,8 @@ DxilResource::DxilResource()
 , m_SamplerFeedbackType((DXIL::SamplerFeedbackType)0)
 , m_bGloballyCoherent(false)
 , m_bHasCounter(false)
-, m_bROV(false) {
+, m_bROV(false)
+, m_bHasAtomic64Use(false) {
 }
 
 CompType DxilResource::GetCompType() const {
@@ -74,6 +75,14 @@ unsigned DxilResource::GetElementStride() const {
 
 void DxilResource::SetElementStride(unsigned ElemStride) {
   m_ElementStride = ElemStride;
+}
+
+unsigned DxilResource::GetBaseAlignLog2() const {
+  return m_baseAlignLog2;
+}
+
+void DxilResource::SetBaseAlignLog2(unsigned baseAlignLog2) {
+  m_baseAlignLog2 = baseAlignLog2;
 }
 
 DXIL::SamplerFeedbackType DxilResource::GetSamplerFeedbackType() const {
@@ -147,6 +156,14 @@ bool DxilResource::IsTBuffer() const {
 
 bool DxilResource::IsFeedbackTexture() const {
   return GetKind() == Kind::FeedbackTexture2D || GetKind() == Kind::FeedbackTexture2DArray;
+}
+
+bool DxilResource::HasAtomic64Use() const {
+  return m_bHasAtomic64Use;
+}
+
+void DxilResource::SetHasAtomic64Use(bool b) {
+  m_bHasAtomic64Use = b;
 }
 
 unsigned DxilResource::GetNumCoords(Kind ResourceKind) {

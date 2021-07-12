@@ -554,6 +554,34 @@ SpirvEmitter::SpirvEmitter(CompilerInstance &ci)
   }
 }
 
+std::vector<SpirvVariable *>
+SpirvEmitter::getInterfacesForEntryPoint(SpirvFunction *entryPoint) {
+  auto stageVars = declIdMapper.collectStageVars(entryPoint);
+  if (!featureManager.isTargetEnvVulkan1p2OrAbove())
+    return stageVars;
+
+  // In SPIR-V 1.4 or above, we must include global variables in the 'Interface'
+  // operands of OpEntryPoint. SpirvModule keeps all global variables, but some
+  // of them can be duplicated with stage variables kept by declIdMapper. Since
+  // declIdMapper keeps the mapping between variables with Input or Output
+  // storage class and their storage class, we have to rely on
+  // declIdMapper.collectStageVars() to collect them.
+  llvm::DenseSet<SpirvVariable *> interfaces;
+  interfaces.insert(stageVars.begin(), stageVars.end());
+  for (auto *moduleVar : spvBuilder.getModule()->getVariables()) {
+    if (moduleVar->getStorageClass() != spv::StorageClass::Input &&
+        moduleVar->getStorageClass() != spv::StorageClass::Output) {
+      interfaces.insert(moduleVar);
+    }
+  }
+  std::vector<SpirvVariable *> interfacesInVector;
+  interfacesInVector.reserve(interfaces.size());
+  for (auto *interface : interfaces) {
+    interfacesInVector.push_back(interface);
+  }
+  return interfacesInVector;
+}
+
 void SpirvEmitter::HandleTranslationUnit(ASTContext &context) {
   // Stop translating if there are errors in previous compilation stages.
   if (context.getDiagnostics().hasErrorOccurred())
@@ -618,9 +646,7 @@ void SpirvEmitter::HandleTranslationUnit(ASTContext &context) {
     spvBuilder.addEntryPoint(
         getSpirvShaderStage(entryInfo->shaderModelKind),
         entryInfo->entryFunction, entryInfo->funcDecl->getName(),
-        featureManager.isTargetEnvVulkan1p2OrAbove()
-            ? spvBuilder.getModule()->getVariables()
-            : llvm::ArrayRef<SpirvVariable *>(declIdMapper.collectStageVars()));
+        getInterfacesForEntryPoint(entryInfo->entryFunction));
   }
 
   // Add Location decorations to stage input/output variables.
@@ -638,14 +664,16 @@ void SpirvEmitter::HandleTranslationUnit(ASTContext &context) {
   // Output the constructed module.
   std::vector<uint32_t> m = spvBuilder.takeModule();
 
-  if (!spirvOptions.codeGenHighLevel) {
-    // In order to flatten composite resources, we must also unroll loops.
-    // Therefore we should run legalization before optimization.
-    needsLegalization = needsLegalization ||
-                        declIdMapper.requiresLegalization() ||
-                        spirvOptions.flattenResourceArrays ||
-                        declIdMapper.requiresFlatteningCompositeResources();
+  // In order to flatten composite resources, we must also unroll loops.
+  // Therefore we should run legalization before optimization.
+  needsLegalization = needsLegalization ||
+                      declIdMapper.requiresLegalization() ||
+                      spirvOptions.flattenResourceArrays ||
+                      declIdMapper.requiresFlatteningCompositeResources();
 
+  if (spirvOptions.codeGenHighLevel) {
+    beforeHlslLegalization = needsLegalization;
+  } else {
     // Run legalization passes
     if (needsLegalization) {
       std::string messages;
@@ -1290,6 +1318,32 @@ bool SpirvEmitter::validateVKAttributes(const NamedDecl *decl) {
     }
   }
 
+  // vk::shader_record_ext is supported only on cbuffer/ConstantBuffer
+  if (const auto *srbAttr = decl->getAttr<VKShaderRecordEXTAttr>()) {
+    const auto loc = srbAttr->getLocation();
+    const HLSLBufferDecl *bufDecl = nullptr;
+    bool isValidType = false;
+    if ((bufDecl = dyn_cast<HLSLBufferDecl>(decl)))
+      isValidType = bufDecl->isCBuffer();
+    else if ((bufDecl = dyn_cast<HLSLBufferDecl>(decl->getDeclContext())))
+      isValidType = bufDecl->isCBuffer();
+    else if (isa<VarDecl>(decl))
+      isValidType = isConstantBuffer(dyn_cast<VarDecl>(decl)->getType());
+
+    if (!isValidType) {
+      emitError(
+          "vk::shader_record_ext can be applied only to cbuffer/ConstantBuffer",
+          loc);
+      success = false;
+    }
+    if (decl->hasAttr<VKBindingAttr>()) {
+      emitError("vk::shader_record_ext attribute cannot be used together with "
+                "vk::binding attribute",
+                loc);
+      success = false;
+    }
+  }
+
   return success;
 }
 
@@ -1319,7 +1373,12 @@ void SpirvEmitter::doHLSLBufferDecl(const HLSLBufferDecl *bufferDecl) {
   if (!validateVKAttributes(bufferDecl))
     return;
   if (bufferDecl->hasAttr<VKShaderRecordNVAttr>()) {
-    (void)declIdMapper.createShaderRecordBufferNV(bufferDecl);
+    (void)declIdMapper.createShaderRecordBuffer(
+        bufferDecl, DeclResultIdMapper::ContextUsageKind::ShaderRecordBufferNV);
+  } else if (bufferDecl->hasAttr<VKShaderRecordEXTAttr>()) {
+    (void)declIdMapper.createShaderRecordBuffer(
+        bufferDecl,
+        DeclResultIdMapper::ContextUsageKind::ShaderRecordBufferEXT);
   } else {
     (void)declIdMapper.createCTBuffer(bufferDecl);
   }
@@ -1401,7 +1460,14 @@ void SpirvEmitter::doVarDecl(const VarDecl *decl) {
   }
 
   if (decl->hasAttr<VKShaderRecordNVAttr>()) {
-    (void)declIdMapper.createShaderRecordBufferNV(decl);
+    (void)declIdMapper.createShaderRecordBuffer(
+        decl, DeclResultIdMapper::ContextUsageKind::ShaderRecordBufferNV);
+    return;
+  }
+
+  if (decl->hasAttr<VKShaderRecordEXTAttr>()) {
+    (void)declIdMapper.createShaderRecordBuffer(
+        decl, DeclResultIdMapper::ContextUsageKind::ShaderRecordBufferEXT);
     return;
   }
 
@@ -2155,6 +2221,36 @@ SpirvInstruction *SpirvEmitter::doCallExpr(const CallExpr *callExpr) {
   return processCall(callExpr);
 }
 
+SpirvInstruction *SpirvEmitter::getBaseOfMemberFunction(QualType objectType,
+                                             SpirvInstruction * objInstr,
+                                             const CXXMethodDecl* memberFn,
+                                       SourceLocation loc) {
+  // If objectType is different from the parent of memberFn, memberFn should be
+  // defined in a base struct/class of objectType. We create OpAccessChain with
+  // index 0 while iterating bases of objectType until we find the base with
+  // the definition of memberFn.
+  if (const auto *ptrType = objectType->getAs<PointerType>()) {
+    if (const auto *recordType = ptrType->getPointeeType()->getAs<RecordType>()) {
+      const auto *parentDeclOfMemberFn = memberFn->getParent();
+      if (recordType->getDecl() != parentDeclOfMemberFn) {
+        const auto *cxxRecordDecl = dyn_cast<CXXRecordDecl>(recordType->getDecl());
+        auto *zero =
+            spvBuilder.getConstantInt(astContext.UnsignedIntTy, llvm::APInt(32, 0));
+        for (auto baseItr = cxxRecordDecl->bases_begin(), itrEnd = cxxRecordDecl->bases_end();
+             baseItr != itrEnd; baseItr++) {
+          const auto *baseType = baseItr->getType()->getAs<RecordType>();
+          objectType = astContext.getPointerType(baseType->desugar());
+          objInstr = spvBuilder.createAccessChain(objectType,
+                                                  objInstr, {zero},
+                                                  loc);
+          if (baseType->getDecl() == parentDeclOfMemberFn) return objInstr;
+        }
+      }
+    }
+  }
+  return nullptr;
+}
+
 SpirvInstruction *SpirvEmitter::processCall(const CallExpr *callExpr) {
   const FunctionDecl *callee = getCalleeDefinition(callExpr);
 
@@ -2205,6 +2301,10 @@ SpirvInstruction *SpirvEmitter::processCall(const CallExpr *callExpr) {
 
       objectType = object->getType();
       objInstr = doExpr(object);
+      if (auto *accessToBaseInstr = getBaseOfMemberFunction(objectType, objInstr, memberFn, memberCall->getExprLoc())) {
+        objInstr = accessToBaseInstr;
+        objectType = accessToBaseInstr->getAstResultType();
+      }
 
       // If not already a variable, we need to create a temporary variable and
       // pass the object pointer to the function. Example:
@@ -2222,7 +2322,7 @@ SpirvInstruction *SpirvEmitter::processCall(const CallExpr *callExpr) {
         // the legalization.
         if (objInstr->getStorageClass() != spv::StorageClass::Function ||
             !isMemoryObjectDeclaration(objInstr))
-          beforeHlslLegalization = true;
+          needsLegalization = true;
 
         args.push_back(objInstr);
       }
@@ -2254,6 +2354,10 @@ SpirvInstruction *SpirvEmitter::processCall(const CallExpr *callExpr) {
 
     auto *argInst = doExpr(arg);
 
+    bool isArgGlobalVarWithResourceType =
+        argInfo && argInfo->getStorageClass() != spv::StorageClass::Function &&
+        isResourceType(paramType);
+
     // If argInfo is nullptr and argInst is a rvalue, we do not have a proper
     // pointer to pass to the function. we need a temporary variable in that
     // case.
@@ -2263,14 +2367,14 @@ SpirvInstruction *SpirvEmitter::processCall(const CallExpr *callExpr) {
     // expects are point-to-pointer argument for resources, which will be
     // resolved by legalization.
     if ((argInfo || (argInst && !argInst->isRValue())) &&
-        canActAsOutParmVar(param) && !isResourceType(paramType) &&
+        canActAsOutParmVar(param) && !isArgGlobalVarWithResourceType &&
         paramTypeMatchesArgType(paramType, arg->getType())) {
       // Based on SPIR-V spec, function parameter must be always Function
       // scope. In addition, we must pass memory object declaration argument
       // to function. If we pass an argument that is not function scope
       // or not memory object declaration, we need the legalization.
       if (!argInfo || argInfo->getStorageClass() != spv::StorageClass::Function)
-        beforeHlslLegalization = true;
+        needsLegalization = true;
 
       isTempVar.push_back(false);
       args.push_back(argInst);
@@ -2320,9 +2424,6 @@ SpirvInstruction *SpirvEmitter::processCall(const CallExpr *callExpr) {
       storeValue(tempVar, rhsVal, paramType, arg->getLocStart());
     }
   }
-
-  if (beforeHlslLegalization)
-    needsLegalization = true;
 
   assert(vars.size() == isTempVar.size());
   assert(vars.size() == args.size());
@@ -2689,7 +2790,7 @@ SpirvInstruction *SpirvEmitter::doCastExpr(const CastExpr *expr) {
     }
 
     if (!subExprInstr)
-      subExprInstr = doExpr(subExpr);
+      subExprInstr = loadIfGLValue(subExpr);
 
     auto *val = processFlatConversion(toType, evalType, subExprInstr,
                                       expr->getExprLoc());
@@ -4360,6 +4461,9 @@ SpirvInstruction *SpirvEmitter::createImageSample(
     SpirvInstruction *minLod, SpirvInstruction *residencyCodeId,
     SourceLocation loc) {
 
+  if (varOffset)
+    needsLegalization = true;
+
   // SampleDref* instructions in SPIR-V always return a scalar.
   // They also have the correct type in HLSL.
   if (compareVal) {
@@ -4792,6 +4896,9 @@ SpirvEmitter::processBufferTextureLoad(const CXXMemberCallExpr *expr) {
         handleOffsetInMethodCall(expr, 1, &constOffset, &varOffset);
     }
 
+    if (varOffset)
+      needsLegalization = true;
+
     return processBufferTextureLoad(object, coordinate, constOffset, varOffset,
                                     lod, status, loc);
   }
@@ -4855,8 +4962,9 @@ SpirvEmitter::doCXXOperatorCallExpr(const CXXOperatorCallExpr *expr) {
 
   auto base = loadIfAliasVarRef(baseExpr);
 
-  if (indices.empty())
-    return base; // For indexing into size-1 vectors and 1xN matrices
+  if (base == nullptr ||
+      indices.empty()) // For indexing into size-1 vectors and 1xN matrices
+    return base;
 
   // If we are indexing into a rvalue, to use OpAccessChain, we first need
   // to create a local variable to hold the rvalue.
@@ -9389,7 +9497,7 @@ SpirvEmitter::processIntrinsicAsType(const CallExpr *callExpr) {
   switch (numArgs) {
   case 1: {
     // Handling Method 1, 2, and 3.
-    auto *argInstr = doExpr(arg0);
+    auto *argInstr = loadIfGLValue(arg0);
     QualType fromElemType = {};
     uint32_t numRows = 0, numCols = 0;
     // For non-matrix arguments (scalar or vector), just do an OpBitCast.
@@ -12203,8 +12311,7 @@ bool SpirvEmitter::spirvToolsValidate(std::vector<uint32_t> *mod,
                  const char *message) { *messages += message; });
 
   spvtools::ValidatorOptions options;
-  options.SetBeforeHlslLegalization(needsLegalization ||
-                                    declIdMapper.requiresLegalization());
+  options.SetBeforeHlslLegalization(beforeHlslLegalization);
   // GL: strict block layout rules
   // VK: relaxed block layout rules
   // DX: Skip block layout rules

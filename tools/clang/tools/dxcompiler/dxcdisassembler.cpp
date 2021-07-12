@@ -342,7 +342,11 @@ PCSTR g_pFeatureInfoNames[] = {
     "Sampler feedback",
     "64-bit Atomics on Typed Resources",
     "64-bit Atomics on Group Shared",
-    "Derivatives in mesh and amplification shaders"
+    "Derivatives in mesh and amplification shaders",
+    "Resource descriptor heap indexing",
+    "Sampler descriptor heap indexing",
+    "<RESERVED>",
+    "64-bit Atomics on Heap Resources",
 };
 static_assert(_countof(g_pFeatureInfoNames) == ShaderFeatureInfoCount, "g_pFeatureInfoNames needs to be updated");
 
@@ -419,7 +423,7 @@ void PrintResourceDim(DxilResourceBase &res, unsigned alignment,
       DxilResource *pRes = static_cast<DxilResource *>(&res);
       std::string dimName = res.GetResDimName();
       if (pRes->GetSampleCount())
-        dimName += pRes->GetSampleCount();
+        dimName += std::to_string(pRes->GetSampleCount());
       OS << right_justify(dimName, alignment);
     } break;
     default:
@@ -1387,16 +1391,13 @@ void PrintResourceProperties(DxilResourceProperties &RP,
   case DXIL::ResourceKind::Texture2DArray:
   case DXIL::ResourceKind::TextureCubeArray:
   case DXIL::ResourceKind::TypedBuffer:
-    OS << GC << RW << ResourceKindToString(RP.getResourceKind());
-    OS << "<" << CompTypeToString(RP.getCompType())
-       << (bUAV && RP.Typed.CompCount > 1 ? "[vec]" : "")
-       << ">";
-    break;
-
   case DXIL::ResourceKind::Texture2DMS:
   case DXIL::ResourceKind::Texture2DMSArray:
-    OS << ResourceKindToString(RP.getResourceKind());
-    OS << "<" << CompTypeToString(RP.getCompType())
+    OS << GC << RW << ResourceKindToString(RP.getResourceKind());
+    OS << "<";
+    if (RP.Typed.CompCount > 1)
+      OS << std::to_string(RP.Typed.CompCount) << "x";
+    OS << CompTypeToString(RP.getCompType())
        << ">";
     break;
 
